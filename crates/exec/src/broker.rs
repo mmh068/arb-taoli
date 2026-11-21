@@ -96,7 +96,7 @@ pub trait Broker: Send + Sync + 'static {
     /// 这个合约下单数量的步长：给 `quantity` 的开仓单，券商把数量**向零**取整到它的整数倍再发，所以给的数量
     /// 本身就是步长的整数倍时原样下出去。必须和 `place` 取整用同一份市场规格。
     ///
-    /// 执行器「两腿同时下」时用它把两腿凑成同一个数量（见 [`crate::executor::Executor::open`]）。默认 `None` =
+    /// 执行器在两腿开仓前用它对齐目标数量（见 [`crate::executor::Executor::open`]）。默认 `None` =
     /// 不知道：两腿照旧顺序下（第二腿按第一腿的实际成交量下）。
     async fn quantity_step(&self, symbol: &Symbol) -> ArbResult<Option<Decimal>> {
         let _ = symbol;

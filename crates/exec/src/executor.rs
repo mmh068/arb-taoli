@@ -374,7 +374,8 @@ impl Executor {
         // 下单前的准备（杠杆核对、市场元数据）两条腿并发做完：第二腿下单时不用再单独往返一次，
         // 第二腿的杠杆设不上也在第一腿成交之前就发现，不必先成交一条再回滚。两腿能不能同时下（要读两家的
         // 数量步长，元数据都已缓存）也一起看。
-        let (first_ready, second_ready, together) = tokio::join!(
+        let concurrent = Self::can_open_concurrently(plan, &first, &second);
+        let (first_ready, second_ready, aligned) = tokio::join!(
             self.prepare_leg(
                 &first,
                 setup.leverage,
@@ -387,27 +388,30 @@ impl Executor {
                 setup.margin_mode,
                 setup.positions_checked
             ),
-            self.concurrent_quantity(plan, &first, &second)
+            self.aligned_open_quantity(&first, &second, concurrent)
         );
-        if let Err(error) = first_ready.and(second_ready) {
-            position.status = PositionStatus::Unwound;
-            position.closed_at = Some(Utc::now());
-            position.note = Some(format!("开仓前的准备没通过，没有下任何单：{error}"));
-            self.persist(&position).await?;
-            warn!(position = %position.id, note = ?position.note, "建仓中止：开仓前准备失败");
-            return Ok(ExecutionOutcome { position });
-        }
+        let aligned = match first_ready.and(second_ready).and(aligned) {
+            Ok(quantity) => quantity,
+            Err(error) => {
+                position.status = PositionStatus::Unwound;
+                position.closed_at = Some(Utc::now());
+                position.note = Some(format!("开仓前的准备没通过，没有下任何单：{error}"));
+                self.persist(&position).await?;
+                warn!(position = %position.id, note = ?position.note, "建仓中止：开仓前准备失败");
+                return Ok(ExecutionOutcome { position });
+            }
+        };
         let ready_at = Utc::now();
         // 各腿各自的往返耗时（下单到拿到结果），记进「双腿建仓完成」：慢在哪家、哪一步，看这里。
         let first_started = Instant::now();
         let first_id = ClientOrderId::for_leg(position_id, first.side, 0);
 
-        // 两腿同时下（见 [`Self::concurrent_quantity`]）：第二腿的第 0 次和第一腿一起发出，数量相同；限价按第一腿的
+        // 两腿同时下时：第二腿的第 0 次和第一腿一起发出，数量相同；限价按第一腿的
         // **预估**均价收紧到保本线（顺序下时按第一腿的实际均价，所以第一腿成交得比预估差时，锁定价差可能比保本线低
         // 那么一点）。它的结果当作第二腿的第 0 次，交给下面的重试、强制补腿、配平与回滚。
         // 同时下时第一腿自己什么时候返回的（耗时、时刻）：两条腿是一起等的，等完再取就成了两腿里慢的那个
         // （11-07～11-14 两条腿都在 Lighter 上的 first_ms 记成 1357～1433ms，其实第一腿约 350ms 就确认了）。
-        let (first_result, first_done, early) = match together {
+        let (first_result, first_done, early) = match aligned.filter(|_| concurrent) {
             Some(quantity) => {
                 let sized = |leg: &LegPlan| LegPlan {
                     notional_usdt: quantity * leg.limit_price,
@@ -445,7 +449,7 @@ impl Executor {
                 (first_result, Some(first_done), Some(early))
             }
             None => (
-                self.submit_first(first_id, &first, setup.leverage, setup.margin_mode, None)
+                self.submit_first(first_id, &first, setup.leverage, setup.margin_mode, aligned)
                     .await,
                 None,
                 None,
@@ -3215,15 +3219,6 @@ impl Executor {
         leg_outcome(&order, state)
     }
 
-    /// 两腿同时下（第二腿不等第一腿的结果）时两腿共同的数量；`None` = 照旧顺序下。
-    ///
-    /// 顺序下时第二腿要等第一腿确认成交才发：Lighter 第一腿约 0.35 秒、Arcus 约 0.1 秒，这段时间里第二腿的盘口
-    /// 可能被别人吃掉。同时下省掉这段，代价是第一腿没成交（或成交太少）时第二腿已经成交、要回滚（用户 10-26 定：
-    /// 只在第一腿不是 Hyperliquid 时这样做 —— 实盘里吃单第一腿没成交的几次都是它，它走链也最慢）。
-    ///
-    /// 只用在两腿都吃单的价差单上。两腿必须下**同一个数量**（顺序下时第二腿直接用第一腿的成交量）：两家都报得出
-    /// 数量步长（[`Broker::quantity_step`]）、粗的步长是细的整数倍时，按第一腿名义 ÷ 限价向下取整到粗的步长；
-    /// 报不出、凑不齐就顺序下。
     /// 爆仓保护减仓的两腿数量（见 [`Self::trim`]）向下取整到各家的数量步长。等比例减（`balanced`）且两家步长
     /// 一粗一细、粗的是细的整数倍时，两腿都按粗的取整到同一个数（取两腿原数量较小的那个）。券商报不出步长的
     /// （纸面）原样不动。任何一条腿取整后为 0 就报错、一单不发：只减一条腿会把对冲拆开。
@@ -3286,52 +3281,57 @@ impl Executor {
         Ok(out)
     }
 
-    async fn concurrent_quantity(
-        &self,
-        plan: &Plan,
-        first: &LegPlan,
-        second: &LegPlan,
-    ) -> Option<Decimal> {
+    /// 只并发发送双吃单价差单；Hyperliquid 第一腿仍等实际成交后再对冲。
+    fn can_open_concurrently(plan: &Plan, first: &LegPlan, second: &LegPlan) -> bool {
         let hyperliquid = matches!(
             first.venue,
             Venue::Hyperliquid | Venue::HyperliquidXyz | Venue::HyperliquidIo
         );
-        if plan.min_locked_basis.is_none()
-            || first.maker_rest_ms.is_some()
-            || second.maker_rest_ms.is_some()
-            || hyperliquid
-            || first.limit_price <= Decimal::ZERO
-        {
-            return None;
-        }
-        let step = |leg: &LegPlan| {
-            let broker = self.broker(leg.venue).ok();
-            let (venue, symbol) = (leg.venue, leg.symbol.clone());
-            async move {
-                match broker?.quantity_step(&symbol).await {
-                    Ok(step) => step.filter(|step| *step > Decimal::ZERO),
-                    Err(error) => {
-                        warn!(%venue, %symbol, %error, "读不到数量步长，两腿照旧顺序下");
-                        None
-                    }
-                }
-            }
+        plan.min_locked_basis.is_some()
+            && first.maker_rest_ms.is_none()
+            && second.maker_rest_ms.is_none()
+            && !hyperliquid
+    }
+
+    /// 两边有步长时，第一腿开仓前对齐；没有规格的券商仍按原方式顺序下单。
+    async fn aligned_open_quantity(
+        &self,
+        first: &LegPlan,
+        second: &LegPlan,
+        concurrent: bool,
+    ) -> ArbResult<Option<Decimal>> {
+        let (a, b) = tokio::try_join!(
+            self.broker(first.venue)?.quantity_step(&first.symbol),
+            self.broker(second.venue)?.quantity_step(&second.symbol),
+        )?;
+        let (Some(a), Some(b)) = (a, b) else {
+            return Ok(None);
         };
-        let (a, b) = tokio::join!(step(first), step(second));
-        let (a, b) = (a?, b?);
-        let (coarse, fine) = if a >= b { (a, b) } else { (b, a) };
-        if !(coarse % fine).is_zero() {
-            return None;
+        let price = if concurrent {
+            first.limit_price
+        } else {
+            first.expected_price
+        };
+        if a <= Decimal::ZERO || b <= Decimal::ZERO || price <= Decimal::ZERO {
+            return Err(ArbError::config(
+                "开仓数量对齐失败：数量步长或第一腿价格非正",
+            ));
         }
-        crate::live_common::floor_to_step(first.notional_usdt / first.limit_price, coarse)
-            .filter(|quantity| *quantity > Decimal::ZERO)
+        let quantity = crate::live_common::floor_to_step(first.notional_usdt / price, a.max(b))
+            .filter(|qty| *qty > Decimal::ZERO && (*qty % a).is_zero() && (*qty % b).is_zero())
+            .ok_or_else(|| {
+                ArbError::config(format!(
+                    "开仓数量对齐失败：裁剪后数量为零或不同时满足两腿步长 {a} / {b}"
+                ))
+            })?;
+        Ok(Some(quantity.normalize()))
     }
 
     /// 双腿的**第一腿**：同 [`Self::submit_with_id`]，但券商能先报出成交数量时
     /// （[`Broker::place_for_hedge`]）立刻返回，好让第二腿马上发出。第三项是待核实的订单状态：
     /// 成交额、均价是偏保守的估计，手续费是估的 —— 第二腿发出之后用 [`Self::settle`] 换成最终状态。
-    /// 券商一次到位时第三项为 `None`，与 `submit_with_id` 完全相同。`quantity` 只在两腿同时下时给
-    /// （两腿同一个数量，见 [`Self::concurrent_quantity`]），平常按名义额下。
+    /// 券商一次到位时第三项为 `None`，与 `submit_with_id` 完全相同。`quantity` 是开仓前对齐后的数量；
+    /// 券商不提供步长时按名义额下。
     async fn submit_first(
         &self,
         client_order_id: ClientOrderId,
@@ -7130,7 +7130,7 @@ mod tests {
             let log = Arc::new(std::sync::Mutex::new(Vec::new()));
             let mut plan = near_plan(Some(dec!(0.000156)));
             plan.long.venue = first_venue;
-            let (outcome, _) = open_concurrent(
+            let (outcome, ledger) = open_concurrent(
                 name,
                 plan,
                 Stepped::wrap(
@@ -7164,7 +7164,35 @@ mod tests {
                 ],
                 "{name}: {order:?}"
             );
+            let (replayed, _) = ledger.replay().await.unwrap();
+            assert_eq!(
+                replayed.orders[&format!("{name}-buy-0")].order.quantity,
+                first_step.map(|_| dec!(149.1)),
+                "{name}"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn a_known_quantity_that_cannot_fit_both_steps_aborts_before_sending() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (outcome, _) = open_concurrent(
+            "unaligned-open",
+            near_plan(None),
+            Stepped::wrap(arcus_fills(&log), Some(dec!(0.09)), 0, &log),
+            Stepped::wrap(
+                Arc::new(Refills::new(Venue::LighterRh, dec!(5.3685), 0)),
+                Some(dec!(0.1)),
+                0,
+                &log,
+            ),
+            near_setup(),
+        )
+        .await;
+        let position = outcome.unwrap().position;
+        assert_eq!(position.status, PositionStatus::Unwound);
+        assert!(position.note.unwrap().contains("开仓数量对齐失败"));
+        assert!(logged(&log).is_empty());
     }
 
     #[tokio::test]
