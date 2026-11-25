@@ -1328,6 +1328,22 @@ cargo test --offline -p arb-exec --lib arcus_broker::tests
 
 ## 部署
 
+### 一键部署（Ubuntu / Debian + systemd）
+
+把项目下载并解压或检出到服务器后，以有 `sudo` 权限的普通用户进入项目根目录，运行：
+
+```bash
+bash deploy/install.sh
+```
+
+脚本按需安装构建工具和 Rust，从本地源码编译 `arb-web`，安装 systemd 服务并设为开机启动。首次部署需要联网下载依赖；脚本不会拉取或更新项目源码。若已用 pm2 运行 `arb-web`，请先停掉旧实例；切换前备份并迁移已有的台账、订单意图日志和暂停状态，脚本不会自动迁移。
+
+- 首次部署从 `.env.example` 创建 `/etc/arb-bot.env`，**不会读取项目目录里的 `.env`，默认不开实盘**。如需改配置，运行 `sudoedit /etc/arb-bot.env`，再执行 `sudo systemctl restart arb-web`。如把 `ARB_SHUTDOWN_GRACE_SEC` 调到 150 秒或以上，先用 `sudo systemctl edit arb-web` 设置更长的 `TimeoutStopSec`（建议排空时限加 30 秒）。
+- 默认只监听 `127.0.0.1:8080`。在自己电脑上运行 `ssh -L 8080:127.0.0.1:8080 用户名@服务器`，再打开 `http://127.0.0.1:8080`。
+- 更新源码后重新运行同一命令即可。脚本会重新构建并重启服务，保留 `/etc/arb-bot.env` 和 `/var/lib/arb-bot` 中的数据。自定义 systemd 设置请放在 `systemctl edit` 创建的覆盖文件里，不要直接修改主单元文件。`sudo systemctl status arb-web` 查看状态，`sudo journalctl -u arb-web -f` 查看日志。
+
+### 其他部署说明
+
 - **pm2**：`ecosystem.config.js`（`kill_timeout` 已按排空时限推出）。改完执行 `pm2 restart arb-web --update-env`、`pm2 save`。
 - **systemd**：`deploy/arb-web.service`（沙箱：`ProtectSystem=strict`、只写 `/var/lib/arb-bot`、`NoNewPrivileges`、
   `MemoryMax`；`TimeoutStopSec` 必须大于排空时限）。密钥放 `/etc/arb-bot.env`（0600）。
